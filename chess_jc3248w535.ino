@@ -15,6 +15,7 @@
 #include <esp_random.h>
 #include <Arduino_GFX_Library.h>
 #include "chess_types.h"
+#include "chess_pieces.h"
 
 // ============================ HARDWARE CONFIG ============================
 #define GFX_BL        1      // backlight pin
@@ -518,17 +519,34 @@ static inline bool inR(int x, int y, int rx, int ry, int rw, int rh) {
   return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
 }
 
+// piece sprite colours: outline, fill, detail
+static const uint16_t SPR_W_OUT = rgb(20, 20, 20),  SPR_W_FILL = rgb(250, 250, 245), SPR_W_DET = rgb(20, 20, 20);
+static const uint16_t SPR_B_OUT = rgb(12, 12, 14),  SPR_B_FILL = rgb(60, 60, 68),    SPR_B_DET = rgb(230, 230, 230);
+
+// draws a 36x36 2-bit sprite centred on (cx, cy), one horizontal run at a time
 static void drawPiece(int pc, int cx, int cy) {
-  int t = abs(pc); bool w = pc > 0;
-  int rad = (t == PAWN) ? 12 : 16;
-  int sz  = (t == PAWN) ? 2 : 3;
-  gfx->fillCircle(cx, cy, rad, w ? C_WEDGE : C_BEDGE);
-  gfx->fillCircle(cx, cy, rad - 2, w ? C_WFILL : C_BFILL);
-  char s[2] = {" PNBRQK"[t], 0};
-  gfx->setTextSize(sz);
-  gfx->setTextColor(w ? C_WEDGE : C_BEDGE);
-  gfx->setCursor(cx - (5 * sz) / 2, cy - (7 * sz) / 2);
-  gfx->print(s);
+  int t = abs(pc);
+  bool w = pc > 0;
+  const uint8_t *spr = PIECE_BMP[t - 1];
+  const uint16_t cOut  = w ? SPR_W_OUT  : SPR_B_OUT;
+  const uint16_t cFill = w ? SPR_W_FILL : SPR_B_FILL;
+  const uint16_t cDet  = w ? SPR_W_DET  : SPR_B_DET;
+  int x0 = cx - PIECE_W / 2, y0 = cy - PIECE_H / 2;
+  for (int y = 0; y < PIECE_H; y++) {
+    const uint8_t *row = spr + y * PIECE_STRIDE;
+    int runCode = 0, start = 0;
+    for (int x = 0; x <= PIECE_W; x++) {
+      int code = (x < PIECE_W) ? ((row[x >> 2] >> ((x & 3) * 2)) & 3) : -1;
+      if (code != runCode) {
+        if (runCode > 0) {
+          uint16_t col = (runCode == 1) ? cOut : (runCode == 2 ? cFill : cDet);
+          gfx->drawFastHLine(x0 + start, y0 + y, x - start, col);
+        }
+        runCode = code;
+        start = x;
+      }
+    }
+  }
 }
 
 static void drawStatus() {
