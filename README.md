@@ -31,10 +31,5 @@ If taps land in the wrong place, set `TOUCH_DEBUG` to 1, watch the Serial
 Monitor, and adjust `TOUCH_SWAP_XY`, `TOUCH_INV_X` and `TOUCH_INV_Y` at the
 top of the sketch.
 
-## Ideas / TODO
-- Piece bitmaps instead of letters
-- Clock increment, resign and draw buttons
-- Opening book, transposition table
-
 ## License
 MIT
