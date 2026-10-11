@@ -12,10 +12,12 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <Preferences.h>
 #include <esp_random.h>
 #include <Arduino_GFX_Library.h>
 #include "chess_types.h"
 #include "chess_pieces.h"
+#include "chess_audio.h"
 
 // ============================ HARDWARE CONFIG ============================
 #define GFX_BL        1      // backlight pin
@@ -415,7 +417,7 @@ static int negamax(const Pos &p, int depth, int alpha, int beta, int ply) {
 }
 
 // ============================ GAME STATE ============================
-enum { ST_MENU, ST_PLAY, ST_PROMO, ST_AI, ST_OVER };
+enum { ST_MENU, ST_PLAY, ST_PROMO, ST_AI, ST_OVER, ST_SOUND };
 static int  state = ST_MENU;
 static int  mode = 1;                // 1 = vs computer, 2 = two players
 static int  humanSide = SIDE_W;
@@ -442,6 +444,11 @@ static int      clockIdx = 0;
 static int32_t  timeLeft[2] = {0, 0};                 // ms
 static uint32_t lastTick = 0;
 static inline bool clockOn() { return mode == 2 && CLOCK_OPTS[clockIdx] > 0; }
+
+// sound volumes, 0 (off) .. 10 (saved in flash)
+static int musicVol = 8, sfxVol = 8;
+static int soundPrev = ST_MENU;          // screen to return to from the sound settings
+static void sfx(int id) { if (sfxVol > 0) audioSfx(id); }
 
 struct Lvl { int depth; uint32_t ms; int noise; };
 static const Lvl LV[3] = {{2, 800, 60}, {4, 2500, 0}, {7, 7000, 0}};
@@ -549,6 +556,25 @@ static void drawPiece(int pc, int cx, int cy) {
   }
 }
 
+// small speaker icon (top-right): X = off, one wave = effects only, two waves = music + effects
+static void drawSoundIcon() {
+  int x = 288, y = 8;
+  gfx->fillRect(x, y + 9, 5, 8, C_TXT);
+  gfx->fillTriangle(x + 5, y + 9, x + 12, y + 3, x + 12, y + 23, C_TXT);
+  gfx->fillTriangle(x + 5, y + 9, x + 12, y + 23, x + 5, y + 17, C_TXT);
+  if (musicVol == 0 && sfxVol == 0) {
+    gfx->drawLine(x + 16, y + 9, x + 24, y + 17, C_RED);
+    gfx->drawLine(x + 24, y + 9, x + 16, y + 17, C_RED);
+  } else {
+    gfx->drawLine(x + 16, y + 9, x + 18, y + 13, C_TXT);
+    gfx->drawLine(x + 18, y + 13, x + 16, y + 17, C_TXT);
+    if (musicVol > 0 && sfxVol > 0) {
+      gfx->drawLine(x + 20, y + 6, x + 23, y + 13, C_TXT);
+      gfx->drawLine(x + 23, y + 13, x + 20, y + 20, C_TXT);
+    }
+  }
+}
+
 static void drawStatus() {
   gfx->fillRect(0, 0, 320, BOARD_Y, C_BAR);
   char buf[40];
@@ -577,6 +603,7 @@ static void drawStatus() {
     if (inChk) col = C_RED;
   }
   textCentered(buf, 160, 12, 2, col);
+  drawSoundIcon();
 }
 
 static void drawBoard() {
@@ -705,8 +732,75 @@ static void drawMenu() {
       drawBtn(8 + i * 64, 310, 56, 50, lb, clockIdx == i);
     }
   }
+  drawBtn(60, 366, 200, 30, "Sound settings", false);
   drawBtn(40, 400, 240, 60, "START", true, C_GO);
   gfx->flush();
+}
+
+// ============================ SOUND SETTINGS ============================
+static void loadSettings() {
+  Preferences p;
+  p.begin("chess", false);
+  musicVol = constrain((int)p.getUChar("mvol", 8), 0, 10);
+  sfxVol   = constrain((int)p.getUChar("svol", 8), 0, 10);
+  p.end();
+}
+
+static void saveSettings() {
+  Preferences p;
+  p.begin("chess", false);
+  p.putUChar("mvol", (uint8_t)musicVol);
+  p.putUChar("svol", (uint8_t)sfxVol);
+  p.end();
+}
+
+static void drawVolRow(int y, const char *name, int level) {
+  char b[24];
+  snprintf(b, sizeof(b), "%s: %d", name, level);
+  textCentered(b, 160, y, 2, C_TXT);
+  drawBtn(10, y + 30, 64, 60, "-", false);
+  drawBtn(246, y + 30, 64, 60, "+", false);
+  for (int i = 0; i < 10; i++)
+    gfx->fillRect(84 + i * 15, y + 42, 12, 36, i < level ? C_BTN_SEL : C_BTN);
+}
+
+static void drawSoundScreen() {
+  gfx->fillScreen(C_BG);
+  textCentered("SOUND", 160, 24, 4, C_TITLE);
+  drawVolRow(90, "Music", musicVol);       // controls at y = 120..180
+  drawVolRow(230, "Effects", sfxVol);      // controls at y = 260..320
+  drawBtn(60, 400, 200, 60, "DONE", true, C_GO);
+  gfx->flush();
+}
+
+static void openSound() {
+  soundPrev = state;
+  state = ST_SOUND;
+  drawSoundScreen();
+}
+
+static void closeSound() {
+  saveSettings();
+  state = soundPrev;
+  if (state == ST_MENU) drawMenu(); else redraw();
+}
+
+static void soundTap(int x, int y) {
+  int *vol = nullptr;
+  bool isSfx = false;
+  if (y >= 120 && y < 180) vol = &musicVol;
+  else if (y >= 260 && y < 320) { vol = &sfxVol; isSfx = true; }
+  if (vol) {
+    if (x >= 10 && x < 74) { if (*vol > 0) (*vol)--; }
+    else if (x >= 246 && x < 310) { if (*vol < 10) (*vol)++; }
+    else if (x >= 84 && x < 236) { *vol = constrain((x - 84) / 15 + 1, 1, 10); }
+    else return;
+    audioSetVolumes(musicVol, sfxVol);
+    if (isSfx) sfx(SFX_MOVE);              // preview the effects volume
+    drawSoundScreen();                      // music is already playing, so you hear its level live
+    return;
+  }
+  if (inR(x, y, 60, 400, 200, 60)) closeSound();
 }
 
 // ============================ GAME FLOW ============================
@@ -732,8 +826,19 @@ static void startAI() {
   xTaskCreatePinnedToCore(aiTask, "ai", 65536, NULL, 1, NULL, 1);
 }
 
+// jingle for the end of the game (win / lose / draw)
+static void playResultSfx() {
+  if (gameResult == 1 || gameResult == 2 || gameResult == 7 || gameResult == 8) {
+    int winner = (gameResult == 1 || gameResult == 8) ? SIDE_W : SIDE_B;   // 7 = white flagged, 8 = black flagged
+    if (mode == 1) sfx(winner == humanSide ? SFX_WIN : SFX_LOSE);
+    else sfx(SFX_WIN);
+  } else {
+    sfx(SFX_DRAW);
+  }
+}
+
 static void afterMove() {
-  if (gameResult) { state = ST_OVER; redraw(); }
+  if (gameResult) { state = ST_OVER; redraw(); playResultSfx(); }
   else if (mode == 1 && CUR.side != humanSide) startAI();
   else { state = ST_PLAY; redraw(); }
 }
@@ -748,6 +853,13 @@ static void applyMove(const Move &m) {
   refreshLegal();
   evalState();
   if (mode == 2 && autoFlip) flipped = (CUR.side == SIDE_B);
+  if (!gameResult) {
+    if (inChk) sfx(SFX_CHECK);
+    else if (m.promo) sfx(SFX_PROMO);
+    else if (m.flags & F_CASTLE) sfx(SFX_CASTLE);
+    else if (m.flags & F_CAP) sfx(SFX_CAPTURE);
+    else sfx(SFX_MOVE);
+  }
   afterMove();
 }
 
@@ -756,6 +868,8 @@ static void newGame() {
   histN = 0; sel = -1; memset(tgt, 0, sizeof(tgt));
   timeLeft[0] = timeLeft[1] = (int32_t)CLOCK_OPTS[clockIdx] * 60000L;
   lastTick = millis();
+  audioRestartMusic();
+  sfx(SFX_START);
   flipped = (mode == 1 && humanSide == SIDE_B);
   refreshLegal();
   evalState();
@@ -812,6 +926,7 @@ static void boardTap(int x, int y) {
   if (own) {
     sel = sq;
     for (int i = 0; i < nLegal; i++) if (legalMv[i].from == sq) tgt[legalMv[i].to] = true;
+    sfx(SFX_SELECT);
   } else {
     sel = -1;
   }
@@ -834,9 +949,11 @@ static void promoTap(int x, int y) {
 }
 
 static void menuTap(int x, int y) {
+  sfx(SFX_TICK);
   if (inR(x, y, 15, 125, 140, 50)) mode = 1;
   else if (inR(x, y, 165, 125, 140, 50)) mode = 2;
   else if (inR(x, y, 40, 400, 240, 60)) { newGame(); return; }
+  else if (inR(x, y, 60, 366, 200, 30)) { openSound(); return; }
   else if (mode == 1) {
     if (inR(x, y, 15, 220, 140, 50)) humanSide = SIDE_W;
     else if (inR(x, y, 165, 220, 140, 50)) humanSide = SIDE_B;
@@ -857,14 +974,20 @@ static void menuTap(int x, int y) {
 }
 
 static void handleTap(int x, int y) {
+  if (state != ST_MENU && state != ST_SOUND && inR(x, y, 284, 2, 34, 36)) {   // speaker icon: sound settings
+    sfx(SFX_TICK);
+    openSound();
+    return;
+  }
   switch (state) {
     case ST_MENU: menuTap(x, y); break;
+    case ST_SOUND: soundTap(x, y); break;
     case ST_AI: break;
     case ST_PROMO: promoTap(x, y); break;
     default:
-      if (inR(x, y, 8, 412, 96, 52)) doUndo();
-      else if (inR(x, y, 112, 412, 96, 52)) { flipped = !flipped; redraw(); }
-      else if (inR(x, y, 216, 412, 96, 52)) showMenu();
+      if (inR(x, y, 8, 412, 96, 52)) { sfx(SFX_TICK); doUndo(); }
+      else if (inR(x, y, 112, 412, 96, 52)) { sfx(SFX_TICK); flipped = !flipped; redraw(); }
+      else if (inR(x, y, 216, 412, 96, 52)) { sfx(SFX_TICK); showMenu(); }
       else if (state == ST_PLAY && y >= BOARD_Y && y < BOARD_Y + 8 * SQ) boardTap(x, y);
       break;
   }
@@ -916,6 +1039,7 @@ static void tickClock() {
     state = ST_OVER;
     sel = -1; memset(tgt, 0, sizeof(tgt));
     redraw();
+    playResultSfx();
     return;
   }
   static int lastSecs = -1, lastSide = -1;
@@ -951,6 +1075,9 @@ void setup() {
   delay(2000);
   Wire.begin(TOUCH_SDA, TOUCH_SCL);
   Wire.setClock(400000);
+  loadSettings();
+  audioBegin();
+  audioSetVolumes(musicVol, sfxVol);
   showMenu();
 }
 
@@ -969,5 +1096,7 @@ void loop() {
   }
   wasDown = down;
   tickClock();
+  audioSetVolumes(musicVol, sfxVol);
+  audioMusic(musicVol > 0 && state != ST_OVER);     // music plays in menu and game, stops when the game ends
   delay(10);
 }
